@@ -17,27 +17,41 @@ from comfy_execution.graph import DynamicPrompt
 class OutputCacheCompat:
     """Handles cache access across ComfyUI versions.
     Uses get_output_cache() in version 0.3.67 and newer, get() in 0.3.66 and lower.
+
+    NOTE (fflosi): In ComfyUI 0.27+, the cache's ``get()`` method became
+    ``async`` and returns a coroutine. Callers here run synchronously
+    (from ``Capture.get_inputs``), so any ``get()``-based path returns
+    an unawaited coroutine, which then crashes ``execution.get_input_data``
+    with ``AttributeError: 'coroutine' object has no attribute 'outputs'``.
+    To stay compatible with both old and new ComfyUI, prefer ``get_local()``
+    (sync accessor available on ``HierarchicalCache``/``LRUCache``/``NullCache``
+    that returns the raw ``CacheEntry`` with an ``.outputs`` attribute).
     """
     def __init__(self, cache):
         self._cache = cache
 
-    def get_output_cache(self, input_unique_id, unique_id=None):
-        # For version 0.3.67 and newer
+    def _sync_get(self, input_unique_id):
+        # Prefer sync accessor available on modern ComfyUI caches.
+        if hasattr(self._cache, "get_local"):
+            return self._cache.get_local(input_unique_id)
+        # Older ComfyUI: .get() was synchronous.
         if hasattr(self._cache, "get"):
             return self._cache.get(input_unique_id)
         return getattr(self._cache, "outputs", {}).get(input_unique_id, None)
 
+    def get_output_cache(self, input_unique_id, unique_id=None):
+        # For version 0.3.67 and newer
+        return self._sync_get(input_unique_id)
+
     def get(self, input_unique_id):
         # For version 0.3.66 and lower
-        if hasattr(self._cache, "get"):
-            return self._cache.get(input_unique_id)
-        return getattr(self._cache, "outputs", {}).get(input_unique_id, None)
-    
+        return self._sync_get(input_unique_id)
+
     # fix: https://github.com/edelvarden/comfyui_image_metadata_extension/issues/67
     def get_cache(self, input_unique_id, unique_id=None):
         if hasattr(self._cache, "get_cache"):
             return self._cache.get_cache(input_unique_id, unique_id)
-        return self.get_output_cache(input_unique_id, unique_id)
+        return self._sync_get(input_unique_id)
 
 
 class Capture:
