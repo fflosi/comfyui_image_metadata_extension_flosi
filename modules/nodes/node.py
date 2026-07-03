@@ -10,6 +10,7 @@ import piexif.helper
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 from enum import Enum
+import random
 
 import folder_paths
 
@@ -41,6 +42,11 @@ class MetadataScope(str, Enum):
     PARAMETERS_ONLY = "parameters_only"
     WORKFLOW_ONLY = "workflow_only"
     NONE = "none"
+
+
+class SaveType(str, Enum):
+    OUTPUT = "outputdir"
+    PREVIEW = "previewdir"
 
 
 # refer. https://github.com/comfyanonymous/ComfyUI/blob/38b7ac6e269e6ecc5bdd6fefdfb2fb1185b09c9d/nodes.py#L1411
@@ -347,6 +353,354 @@ class SaveImageWithMetaData:
                 filename = filename.replace(segment, date_format)
 
         return filename
+
+
+class SaveImageWithMetaDataV2:
+    OUTPUT_FORMATS = [e for e in OutputFormat]
+    QUALITY_OPTIONS = [e for e in QualityOption]
+    METADATA_OPTIONS = [e for e in MetadataScope]
+    SAVETYPE_OPTIONS = [e for e in SaveType]
+    NEEDS_METADATA_KEYS = {"seed", "width", "height", "pprompt", "nprompt", "model"}
+
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+        self.type = "output"
+        self.prefix_append = ""
+        self.compress_level = 4
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "The images to save."}),
+                "savetype": (s.SAVETYPE_OPTIONS, {"tooltip": "Save to Output ot temp"}),
+                "filename_prefix": ("STRING", {"default": "ComfyUI", "tooltip": "The prefix for the saved file. You can include formatting options like %date:yyyy-MM-dd% or %seed%, and combine them as needed, e.g., %date:hhmmss%_%seed%."}),
+                "subdirectory_name": ("STRING", {
+                    "default": "",
+                    "tooltip": (
+                        "Custom directory to save the images. Leave empty to use the default output "
+                        "directory. You can include formatting options like %date:yyyy-MM-dd%."
+                    ),
+                }),
+                "output_format": (s.OUTPUT_FORMATS, {
+                    "tooltip": "The format in which the images will be saved."
+                }),
+                "Prompt_node_name": ("STRING", {
+                    "default": "auto",
+                    "tooltip": "Name of the node to look for the Positive prompt. Use 'auto' for default behavior."
+                }),
+            },
+            "optional": {
+                "extra_metadata": ("EXTRA_METADATA", {
+                    "tooltip": "Additional key-value metadata to include in the image."
+                }),
+                "quality": (s.QUALITY_OPTIONS, {
+                    "tooltip": "Image quality:"
+                            "\n'max' / 'lossless WebP' - 100"
+                            "\n'high' - 80"
+                            "\n'medium' - 60"
+                            "\n'low' - 30"
+                            "\n\nNote: Lower quality, smaller file size. PNG images ignore this setting."
+                }),
+                "metadata_scope": (s.METADATA_OPTIONS, {
+                    "tooltip": "Choose the metadata to save: "
+                            "\n'full' - default metadata with additional metadata, "
+                            "\n'default' - same as SaveImage node, "
+                            "\n'parameters_only' - only A1111-style metadata, "
+                            "\n'workflow_only' - workflow metadata only, "
+                            "\n'none' - no metadata."
+                }),
+                "include_batch_num": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Include batch number in filename."
+                }),
+                "prefer_nearest": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Select inputs from closest nodes first if true."
+                }),
+                "ReplaceMetadata": ("PNGINFO_DICT", {
+                    "tooltip": "If provided, use this metadata instead of generating new."
+                }),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO"
+            },
+        }
+
+    RETURN_TYPES = ("PNGINFO_DICT",)
+    FUNCTION = "save_images"
+    OUTPUT_NODE = True
+    DESCRIPTION = "Saves the input images with metadata to your ComfyUI output directory."
+    CATEGORY = "SaveImage"
+
+    pattern_format = re.compile(r"(%[^%]+%)") # Pattern to match mask values in the filename
+
+    def parse_output_format(self, output_format: str):
+        fmt = OutputFormat(output_format)
+        save_workflow_json = fmt.name.endswith("JSON")
+        base_format = fmt.replace("_with_json", "")
+        return base_format, save_workflow_json
+
+    def get_quality_value(self, quality: str) -> int:
+        return {
+            QualityOption.MAX: 100,
+            QualityOption.HIGH: 80,
+            QualityOption.MEDIUM: 60,
+            QualityOption.LOW: 30
+        }.get(quality, 100)
+
+    def find_next_available_filename(self, folder: str, name: str, ext: str):
+        """
+        Finds the next available filename by checking existing files in the directory.
+        """
+        existing = {f.stem for f in Path(folder).glob(f"{name}_*.{ext}")}
+        i = 1
+        while f"{name}_{i:05d}" in existing:
+            i += 1
+        #print_warning(f"name in find_next_available_filename: {name}")
+
+        return i
+
+    @classmethod
+    def parse_filename_placeholders(cls, filename: str) -> list[str]:
+        """Extracts placeholder segments like %seed%, %pprompt:32%, etc."""
+        return re.findall(cls.pattern_format, filename) if "%" in filename else []
+
+    def needs_pnginfo_in_filename(self, segments: list[str]) -> bool:
+        for segment in segments:
+            parts = segment.strip("%").split(":")
+            if parts[0] in self.NEEDS_METADATA_KEYS:
+                return True
+        return False
+
+    def save_images(self, images, filename_prefix="ComfyUI", subdirectory_name="", prompt=None,
+                    extra_pnginfo=None, extra_metadata=None, output_format="png",
+                    quality="max", metadata_scope="full",
+                    include_batch_num=True, prefer_nearest=True, pnginfo_dict=None,
+                    savetype="outputdir", Prompt_node_name="auto", ReplaceMetadata=None):
+
+        #print("**DEBUG PROMPT**:", prompt)  # Add this line for debugging
+        extra_metadata = extra_metadata or {}
+        base_format, save_workflow_json = self.parse_output_format(output_format)
+        pnginfo = PngInfo()
+
+        if savetype in [SaveType.OUTPUT]:
+            #print_warning(f"Using savetype: {savetype}")
+            self.output_dir = folder_paths.get_output_directory()
+            self.type = "output"
+           
+        if savetype in [SaveType.PREVIEW]:
+            #print_warning(f"Using savetype: {savetype}")
+            self.output_dir = folder_paths.get_temp_directory()
+            filename_prefix = filename_prefix + "_temp_" + ''.join(random.choice("abcdefghijklmnopqrstupvxyz") for x in range(5))
+            self.type = "temp"
+            #self.filename_prefix = filename_prefix
+
+        # Parse filename
+        #print_warning(f"filename_prefix: {filename_prefix}")
+
+        filename_prefix = filename_prefix.strip()
+        segments = self.parse_filename_placeholders(filename_prefix)
+        #print("**DEBUG ReplaceMetadata**: {}".format(ReplaceMetadata))  # Debugging line
+        # Use ReplaceMetadata if provided
+        if ReplaceMetadata is not None:
+            pnginfo_dict = ReplaceMetadata
+        elif metadata_scope in [MetadataScope.FULL, MetadataScope.PARAMETERS_ONLY] or self.needs_pnginfo_in_filename(segments):
+            pnginfo_dict = pnginfo_dict or self.gen_pnginfo(prompt, prefer_nearest, Prompt_node_name)
+        #print("**DEBUG pnginfo_dict**: {}".format(pnginfo_dict))  # Debugging line
+        filename_prefix = self.format_filename(filename_prefix, pnginfo_dict or {}, segments) + self.prefix_append
+        subdirectory_name = self.format_filename(subdirectory_name, pnginfo_dict or {})
+
+
+        image_shape = images[0].shape
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix, self.output_dir, image_shape[1], image_shape[0]
+        )
+
+        # Handle subdirectory naming and creation
+        subdirectory_name = subdirectory_name.strip()
+        if subdirectory_name:
+            subdirectory_name = self.format_filename(subdirectory_name, pnginfo_dict)
+            full_output_folder = os.path.join(self.output_dir, subdirectory_name)
+            filename = filename_prefix
+
+        os.makedirs(full_output_folder, exist_ok=True)
+
+        results = list()
+        images_length = len(images)
+        last_image_filename = None
+        #print_warning(f"filename: {filename}")
+        #print_warning(f"filename_prefix: {filename_prefix}")
+        
+        # Process each image
+        for batch_number, image in enumerate(images):
+            i = 255. * image.cpu().numpy()
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+
+            # Prepare metadata
+            metadata = self.prepare_pnginfo(pnginfo, pnginfo_dict, batch_number, images_length, prompt, extra_pnginfo, metadata_scope)
+            for key, value in extra_metadata.items():
+                metadata.add_text(key, value)
+
+            # Handle filename collision and batch number inclusion
+            file = f"{filename}_{batch_number:05d}.{base_format}" if include_batch_num else f"{filename}.{base_format}"
+            path = os.path.join(full_output_folder, file)
+
+            # Check for filename collision (using next available name)
+            if os.path.exists(path):
+                count = self.find_next_available_filename(full_output_folder, filename, base_format)
+                file = f"{filename}_{count:05d}.{base_format}"
+                path = os.path.join(full_output_folder, file)
+
+            last_image_filename = file
+            quality_value = self.get_quality_value(quality)
+
+            # Save image based on format
+            if base_format == "webp":
+                img.save(path, "WEBP", lossless=(quality_value == 100), quality=quality_value)
+            elif base_format == "png":
+                img.save(path, pnginfo=metadata, compress_level=self.compress_level)
+            else:
+                img.save(path, optimize=True, quality=quality_value)
+
+            # Insert EXIF for jpg/webp formats
+            if base_format in ["jpg", "webp"]:
+                exif_bytes = piexif.dump({
+                    "Exif": {
+                        piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(Capture.gen_parameters_str(pnginfo_dict), encoding="unicode")
+                    }
+                })
+                piexif.insert(exif_bytes, path)
+
+            results.append({"filename": file, "subfolder": full_output_folder, "type": self.type})
+
+        # Save workflow metadata for the batch
+        if save_workflow_json and images_length > 0 and last_image_filename:
+            json_filename = last_image_filename.replace(base_format, "json")
+            batch_json_file = os.path.join(full_output_folder, json_filename)
+
+            with open(batch_json_file, "w", encoding="utf-8") as f:
+                json.dump(extra_pnginfo["workflow"], f)
+
+        # At the end, return the pnginfo_dict as output
+        #print("**DEBUG pnginfo_dict before return**: {}".format(pnginfo_dict))  # Debugging line
+        
+        return {"ui": {"images": results}, "result": (pnginfo_dict,)}
+        
+
+    def prepare_pnginfo(self, metadata, pnginfo_dict, batch_number, total_images, prompt, extra_pnginfo, metadata_scope):
+        """
+        Return final PNG metadata with batch information, parameters, and optional prompt details.
+        """
+        if metadata_scope == MetadataScope.NONE:
+            return None
+
+        if pnginfo_dict:
+            pnginfo_copy = pnginfo_dict.copy()
+
+            if total_images > 1:
+                pnginfo_copy["Batch index"] = batch_number
+                pnginfo_copy["Batch size"] = total_images
+
+            if metadata_scope in [MetadataScope.FULL, MetadataScope.PARAMETERS_ONLY]:
+                parameters = Capture.gen_parameters_str(pnginfo_copy)
+                if parameters and "Steps" in parameters:
+                    metadata.add_text("parameters", parameters)
+                    if metadata_scope == MetadataScope.PARAMETERS_ONLY:
+                        return metadata
+
+        if prompt is not None and metadata_scope != MetadataScope.WORKFLOW_ONLY:
+            metadata.add_text("prompt", json.dumps(prompt))
+
+        if extra_pnginfo is not None:
+            for x in extra_pnginfo:
+                metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+        print_warning (metadata)
+        
+        return metadata
+
+    @classmethod
+    #def gen_pnginfo(s, prompt, prefer_nearest, Prompt_node_name="auto", Model_node_name="auto"):
+    def gen_pnginfo(s, prompt, prefer_nearest, Prompt_node_name="auto"):
+        inputs = Capture.get_inputs()
+        trace_tree_from_this_node = Trace.trace(hook.current_save_image_node_id, prompt)
+        inputs_before_this_node = Trace.filter_inputs_by_trace_tree(inputs, trace_tree_from_this_node, prefer_nearest)
+        #print("**DEBUG inputs_before_this_node**:", dict(inputs_before_this_node))  # Debugging line
+        sampler_node_id = Trace.find_sampler_node_id(trace_tree_from_this_node)
+        #print("**DEBUG sampler_node_id**:", sampler_node_id)  # Debugging line
+        if sampler_node_id:
+            trace_tree_from_sampler_node = Trace.trace(sampler_node_id, prompt)
+            inputs_before_sampler_node = Trace.filter_inputs_by_trace_tree(inputs, trace_tree_from_sampler_node, prefer_nearest)
+        else:
+            inputs_before_sampler_node = {}
+        #print("**DEBUG inputs_before_sampler_node**:", dict(inputs_before_sampler_node))  # Debugging line)
+    # Pass both node names to gen_pnginfo_dict
+        return Capture.gen_pnginfo_dict(inputs_before_sampler_node, inputs_before_this_node, prompt, Prompt_node_name) #, Model_node_name)
+
+    @classmethod
+    def format_filename(cls, filename, pnginfo_dict, segments=None):
+        """
+        Replaces placeholders in the filename with actual values like date, seed, prompt, etc.
+        """
+        if "%" not in filename:
+            return filename
+
+        segments = segments or re.findall(cls.pattern_format, filename)
+        now = datetime.now()
+        date_table = {
+            "yyyy": f"{now.year}",
+            "MM": f"{now.month:02d}",
+            "dd": f"{now.day:02d}",
+            "hh": f"{now.hour:02d}",
+            "mm": f"{now.minute:02d}",
+            "ss": f"{now.second:02d}",
+        }
+
+        for segment in segments:
+            parts = segment.strip("%").split(":")
+            key = parts[0]
+
+            if key == "seed":
+                seed = pnginfo_dict.get("Seed")
+                if seed is None:
+                    print_warning("Seed not found in pnginfo_dict!")
+                filename = filename.replace(segment, str(seed or ""))
+
+            elif key in {"width", "height"}:
+                size = pnginfo_dict.get("Size", "x").split("x")
+                if "Size" not in pnginfo_dict:
+                    print_warning("Size not found in pnginfo_dict!")
+                value = size[0] if key == "width" else size[1]
+                filename = filename.replace(segment, value)
+
+            elif key in {"pprompt", "nprompt"}:
+                prompt_key = "Positive prompt" if key == "pprompt" else "Negative prompt"
+                prompt = pnginfo_dict.get(prompt_key, "")
+                if not prompt:
+                    print_warning(f"{prompt_key} not found in pnginfo_dict!")
+                prompt = prompt.replace("\n", " ")
+                length = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                filename = filename.replace(segment, prompt[:length].strip() if length else prompt.strip())
+
+            elif key == "model":
+                model = pnginfo_dict.get("Model", "")
+                #print_warning(f"Model Debug {model}")
+                if not model:
+                    print_warning("Model not found in pnginfo_dict!")
+                model = os.path.splitext(os.path.basename(model))[0]
+                #print_warning(f"Model Debug {model}")
+                length = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                filename = filename.replace(segment, model[:length] if length else model)
+
+            elif key == "date":
+                date_format = parts[1] if len(parts) > 1 else "yyyyMMddhhmmss"
+                for k, v in date_table.items():
+                    date_format = date_format.replace(k, v)
+                filename = filename.replace(segment, date_format)
+
+        return filename
+
 
 
 class CreateExtraMetaData:
