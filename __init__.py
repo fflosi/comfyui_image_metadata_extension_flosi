@@ -1,8 +1,9 @@
-from .modules.nodes.node import SaveImageWithMetaData, CreateExtraMetaData
+from .modules.nodes.node import SaveImageWithMetaData, CreateExtraMetaData, SaveImageWithMetaDataV2
 
 # (base_name, class_ref, display_name)
 node_definitions = [
     ("SaveImageWithMetaData", SaveImageWithMetaData, "Save Image With MetaData"),
+    ("SaveImageWithMetaDataV2", SaveImageWithMetaDataV2, "Save Image With MetaData V2"),
     ("CreateExtraMetaData", CreateExtraMetaData, "Create Extra MetaData"),
 ]
 

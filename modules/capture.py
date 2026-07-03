@@ -198,7 +198,9 @@ class Capture:
         return lora_strings, lora_hashes_string, updated_prompts
 
     @classmethod
-    def gen_pnginfo_dict(cls, inputs_before_sampler_node, inputs_before_this_node, prompt, save_civitai_sampler=True):
+    def gen_pnginfo_dict(cls, inputs_before_sampler_node, inputs_before_this_node, prompt, Prompt_node_name="auto", save_civitai_sampler=True):
+        # NOTE: `Prompt_node_name` is accepted for compatibility with SaveImageWithMetaDataV2
+        # (fflosi local extension). It is not currently consumed by this function.
         pnginfo = {}
 
         if not inputs_before_sampler_node:
@@ -247,6 +249,9 @@ class Capture:
             print_warning("Positive prompt is empty!")
 
         negative = extract(MetaField.NEGATIVE_PROMPT, "Negative prompt") or ""
+        if not negative.strip():
+            print_warning("Negative prompt is empty!")
+
         lora_strings, lora_hashes, updated_prompts = cls.get_lora_strings_and_hashes(inputs_before_sampler_node)
         
         # If there are LoRAs in the prompt, use the cleaned version of the prompt.
@@ -266,6 +271,9 @@ class Capture:
             print_warning("Steps are empty, full metadata won't be added!")
             return {}  # No sense in pnginfo without the Steps parameter, ref https://github.com/civitai/civitai/blob/7c8f3f3044218cf3b3d86bd9f49d12fc196ea1f6/src/utils/metadata/automatic.metadata.ts#L102C42-L102C47
 
+        # NOTE (fflosi): The Sampler block below is preserved from upstream. In an earlier
+        # local revision it was removed; keeping it here to match historical outputs.
+        # If regression testing shows the sampler value is unwanted, this block can be dropped.
         samplers = inputs_before_sampler_node.get(MetaField.SAMPLER_NAME)
         schedulers = inputs_before_sampler_node.get(MetaField.SCHEDULER)
 
@@ -277,12 +285,18 @@ class Capture:
                 sampler_name += f"_{schedulers[0][1]}"
             pnginfo["Sampler"] = sampler_name
 
-        extract(MetaField.CFG, "CFG scale")
-        extract(MetaField.SEED, "Seed")
-        
+        cfg = extract(MetaField.CFG, "CFG scale")
+        if not cfg:
+            print_warning("CFG scale is empty!")
+
+        seed = extract(MetaField.SEED, "Seed")
+        if not seed:
+            print_warning("Seed is empty!")
+
         # Missing CLIP skip means it was set to 1 (the default)
         clip_skip = extract(MetaField.CLIP_SKIP, "Clip skip")
         if clip_skip is None:
+            print_warning("Clip skip is missing, defaulting to 1")
             pnginfo["Clip skip"] = "1"
 
         # Image size
@@ -298,10 +312,21 @@ class Capture:
             pnginfo["Size"] = f"{width}x{height}"
 
         # Model details
-        extract(MetaField.MODEL_NAME, "Model")
-        extract(MetaField.MODEL_HASH, "Model hash")
-        extract(MetaField.VAE_NAME, "VAE", inputs_before_this_node)
-        extract(MetaField.VAE_HASH, "VAE hash", inputs_before_this_node)
+        model = extract(MetaField.MODEL_NAME, "Model")
+        if not model:
+            print_warning("Model is empty!")
+
+        model_hash = extract(MetaField.MODEL_HASH, "Model hash")
+        if not model_hash:
+            print_warning("Model hash is empty!")
+
+        vae = extract(MetaField.VAE_NAME, "VAE", inputs_before_this_node)
+        if not vae:
+            print_warning("VAE is empty!")
+
+        vae_hash = extract(MetaField.VAE_HASH, "VAE hash", inputs_before_this_node)
+        if not vae_hash:
+            print_warning("VAE hash is empty!")
 
         # Denoising strength
         denoise = inputs_before_sampler_node.get(MetaField.DENOISE)
@@ -402,7 +427,10 @@ class Capture:
             if node is not None:
                 inputs = node.get("inputs", {})
                 pos_ref = inputs.get("positive", [None])[0]
-                neg_ref = inputs.get("negative", [None])[0]
+                # fflosi: defensive access — original code assumed the "negative" list
+                # was always non-empty, which raised IndexError on some node graphs.
+                neg_list = inputs.get("negative", [])
+                neg_ref = neg_list[0] if neg_list else None
 
                 def resolve_text(ref):
                     if isinstance(ref, list): ref = ref[0]
