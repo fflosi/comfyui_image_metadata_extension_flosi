@@ -111,23 +111,103 @@ class Capture:
                     # Fetch and process value from field_name
                     field_name = field_data["field_name"]
                     value = input_data[0].get(field_name)
+                    before_len = len(inputs[meta])
                     if value is not None:
                         format_func = field_data.get("format")
                         v = cls._apply_formatting(value, input_data, format_func)
                         cls._append_value(inputs, meta, node_id, v)
 
-        # fflosi debug: surface what the collector actually captured for
-        # POSITIVE / NEGATIVE prompt so we can diagnose the "negative shows
-        # up as positive" symptom (see gen_pnginfo_dict guard below).
-        print("[metadata-ext DEBUG] POSITIVE_PROMPT:", inputs.get(MetaField.POSITIVE_PROMPT))
-        print("[metadata-ext DEBUG] NEGATIVE_PROMPT:", inputs.get(MetaField.NEGATIVE_PROMPT))
+                    # fflosi (Option B safety net): if this is a prompt field
+                    # and the standard link resolution produced nothing usable
+                    # (empty list, None, `(None,)`, etc.), walk the raw link
+                    # chain in the prompt graph to find a literal text source.
+                    # This recovers cases like DPRandomGenerator / ShowText /
+                    # Text Multiline feeding a CLIPTextEncode whose expanded
+                    # string never landed in ComfyUI's executor cache.
+                    if (
+                        meta in (MetaField.POSITIVE_PROMPT, MetaField.NEGATIVE_PROMPT)
+                        and len(inputs[meta]) == before_len
+                    ):
+                        raw_ref = node_inputs.get(field_name)
+                        walked = cls._walk_link_for_text(prompt, raw_ref)
+                        if walked:
+                            cls._append_value(inputs, meta, node_id, walked)
+
+        # fflosi debug: only surface collector state when the positive prompt
+        # slot is still empty after the link-walker fallback. Silent on the
+        # happy path; noisy only when something's actually wrong.
+        if not inputs.get(MetaField.POSITIVE_PROMPT):
+            print_warning("POSITIVE_PROMPT collection empty after fallback. Diagnostic dump:")
+            print_warning(f"  POSITIVE_PROMPT: {inputs.get(MetaField.POSITIVE_PROMPT)}")
+            print_warning(f"  NEGATIVE_PROMPT: {inputs.get(MetaField.NEGATIVE_PROMPT)}")
 
         return inputs
+
+    # Field names that commonly carry prompt/text on upstream nodes we may
+    # need to walk into (CLIPTextEncode, DPRandomGenerator, ShowText,
+    # Text Multiline, Impact wildcard nodes, WAS text nodes, etc.).
+    _TEXT_FIELD_CANDIDATES = ("text", "text_0", "prompt", "string", "wildcard_text")
+
+    @classmethod
+    def _walk_link_for_text(cls, prompt, ref, max_depth=8, seen=None):
+        """Follow a link chain in the prompt graph looking for a literal text.
+
+        ``ref`` is either a raw literal string, or a link value like
+        ``["74", 0]`` pointing to another node. On each hop we inspect a
+        prioritized set of common text-carrying input fields; the first
+        non-empty literal string wins. Returns ``None`` if nothing usable
+        is found within ``max_depth`` hops. Cycle-safe via ``seen``.
+        """
+        if seen is None:
+            seen = set()
+        if max_depth <= 0:
+            return None
+
+        # Already a literal, non-empty string -> done.
+        if isinstance(ref, str) and ref.strip():
+            return ref
+
+        # Only link-shaped values are worth following further.
+        if not isinstance(ref, (list, tuple)) or not ref:
+            return None
+
+        target_id = ref[0]
+        if isinstance(target_id, int):
+            target_id = str(target_id)
+        if not isinstance(target_id, str) or target_id in seen:
+            return None
+        seen.add(target_id)
+
+        node = prompt.get(target_id)
+        if not isinstance(node, dict):
+            return None
+        node_inputs = node.get("inputs", {})
+        if not isinstance(node_inputs, dict):
+            return None
+
+        # Try priority fields first; if the value is a literal string, take
+        # it; if it's another link, recurse.
+        for candidate in cls._TEXT_FIELD_CANDIDATES:
+            if candidate not in node_inputs:
+                continue
+            val = node_inputs[candidate]
+            if isinstance(val, str) and val.strip():
+                return val
+            if isinstance(val, (list, tuple)):
+                found = cls._walk_link_for_text(prompt, val, max_depth - 1, seen)
+                if found:
+                    return found
+
+        return None
 
     @staticmethod
     def _apply_formatting(value, input_data, format_func):
         """Apply formatting to a value using the given format function."""
-        if isinstance(value, list) and len(value) > 0:
+        # fflosi: ComfyUI's get_input_data returns link-resolved values wrapped
+        # in either a list OR a tuple depending on the cache/back-end version.
+        # Original code only unwrapped lists, which let junk like `(None,)` slip
+        # through as a real value and pollute the POSITIVE_PROMPT list.
+        if isinstance(value, (list, tuple)) and len(value) > 0:
             value = value[0]
         if format_func:
             value = format_func(value, input_data)
@@ -136,9 +216,12 @@ class Capture:
     @staticmethod
     def _append_value(inputs, meta, node_id, value):
         """Append processed value to the inputs list."""
-        if isinstance(value, list):
+        # fflosi: accept tuples too (see _apply_formatting) and drop None so a
+        # failed link resolution never becomes a spurious candidate.
+        if isinstance(value, (list, tuple)):
             for x in value:
-                inputs[meta].append((node_id, x))
+                if x is not None:
+                    inputs[meta].append((node_id, x))
         elif value is not None:
             inputs[meta].append((node_id, value))
 
