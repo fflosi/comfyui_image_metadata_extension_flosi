@@ -146,7 +146,13 @@ class Capture:
     # Field names that commonly carry prompt/text on upstream nodes we may
     # need to walk into (CLIPTextEncode, DPRandomGenerator, ShowText,
     # Text Multiline, Impact wildcard nodes, WAS text nodes, etc.).
-    _TEXT_FIELD_CANDIDATES = ("text", "text_0", "prompt", "string", "wildcard_text")
+    # fflosi: `text_0` is intentionally listed FIRST — on nodes like
+    # `ShowText|pysssss` it holds the resolved/expanded snapshot of what
+    # actually flowed through, which is usually more useful than walking
+    # further upstream to a raw wildcard template. If `text_0` is missing
+    # or empty on a given node, the walker falls through to `text` (link)
+    # and recurses.
+    _TEXT_FIELD_CANDIDATES = ("text_0", "text", "prompt", "string", "wildcard_text")
 
     @classmethod
     def _walk_link_for_text(cls, prompt, ref, max_depth=8, seen=None):
@@ -209,6 +215,12 @@ class Capture:
         # through as a real value and pollute the POSITIVE_PROMPT list.
         if isinstance(value, (list, tuple)) and len(value) > 0:
             value = value[0]
+        # fflosi: bail out early if the unwrapped value is None. Downstream
+        # formatters (extract_embedding_names, calc_lora_hash, etc.) don't
+        # guard against None and would raise TypeError. Returning None here
+        # lets _append_value drop it cleanly.
+        if value is None:
+            return None
         if format_func:
             value = format_func(value, input_data)
         return value
