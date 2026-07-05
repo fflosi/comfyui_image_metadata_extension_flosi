@@ -116,6 +116,12 @@ class Capture:
                         v = cls._apply_formatting(value, input_data, format_func)
                         cls._append_value(inputs, meta, node_id, v)
 
+        # fflosi debug: surface what the collector actually captured for
+        # POSITIVE / NEGATIVE prompt so we can diagnose the "negative shows
+        # up as positive" symptom (see gen_pnginfo_dict guard below).
+        print("[metadata-ext DEBUG] POSITIVE_PROMPT:", inputs.get(MetaField.POSITIVE_PROMPT))
+        print("[metadata-ext DEBUG] NEGATIVE_PROMPT:", inputs.get(MetaField.NEGATIVE_PROMPT))
+
         return inputs
 
     @staticmethod
@@ -267,11 +273,16 @@ class Capture:
             print_warning("Negative prompt is empty!")
 
         lora_strings, lora_hashes, updated_prompts = cls.get_lora_strings_and_hashes(inputs_before_sampler_node)
-        
+
         # If there are LoRAs in the prompt, use the cleaned version of the prompt.
-        if updated_prompts:
+        # fflosi fix: only overwrite `positive` when a positive prompt was actually
+        # captured. `updated_prompts` is built from POSITIVE_PROMPT + NEGATIVE_PROMPT
+        # (positive first). If POSITIVE_PROMPT is empty, `updated_prompts[0]` is the
+        # first NEGATIVE text -> without this guard the negative prompt gets promoted
+        # into the positive slot and then LoRA tags get appended to it.
+        if updated_prompts and positive:
             positive = updated_prompts[0]
-            
+
         # Append LoRA models to the positive prompt, which is required for the Civitai website to parse and apply LoRA weights.
         # Format: <lora:Lora_Model_Name:weight_value>. Example: <lora:Lora_Name_00:0.6> <lora:Lora_Name_01:0.8>
         if lora_strings:
